@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: dishscheduler
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: HC_CLIENT_ID
+        value: 3B81B2BBDD52C6B5E293AFB427ED365D26F259096CB454A5057BF539A1BE26E7
+      - key: HC_CLIENT_SECRET
+        value: B7B2CAD4DAE2C1687977BD28158141D5348F049C76AE7198D0D269E4ED8F45F2
+      - key: HC_APPLIANCE_ID
+        value: 484060541408005542
+      - key: HC_KEEP_ALIVE
+        value: "true"
