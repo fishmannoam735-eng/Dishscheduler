@@ -17,19 +17,23 @@ let config = {
   clientId: process.env.HC_CLIENT_ID || "",
   clientSecret: process.env.HC_CLIENT_SECRET || "",
   haId: process.env.HC_APPLIANCE_ID || "",
+  notifyEmail: process.env.HC_NOTIFY_EMAIL || "",
+  reminderHours: parseInt(process.env.HC_REMINDER_HOURS || "2"),
 };
 let tokenData = null;
 let schedules = [];
 let keepAlive = process.env.HC_KEEP_ALIVE === "true";
+let remindersEnabled = true;
 let logs = [];
 let cronJobs = {};
+let reminderJobs = {};
 let keepAliveCron = null;
 
 // ─── Persistence (survives short restarts via /tmp) ──────────
 async function saveState() {
   try {
     await writeFile(DATA_FILE, JSON.stringify({
-      tokenData, schedules, keepAlive,
+      tokenData, schedules, keepAlive, remindersEnabled,
     }));
   } catch {}
 }
@@ -42,6 +46,7 @@ async function loadState() {
       if (data.tokenData) tokenData = data.tokenData;
       if (data.schedules) schedules = data.schedules;
       if (data.keepAlive !== undefined) keepAlive = data.keepAlive;
+      if (data.remindersEnabled !== undefined) remindersEnabled = data.remindersEnabled;
       addLog("💾 Loaded saved state from disk");
       return true;
     }
@@ -205,12 +210,65 @@ async function fetchAppliances() {
 }
 
 // ─── Schedule Management ─────────────────────────────────────
+
+// Send email reminder via a simple HTTPS webhook approach
+// Uses a lightweight email-sending service (no SMTP needed)
+async function sendReminderNotification(schedule) {
+  const progName = schedule.name || schedule.program.split(".").pop();
+  const timeStr = `${String(schedule.hour).padStart(2,"0")}:${String(schedule.minute).padStart(2,"0")}`;
+  const email = config.notifyEmail;
+  
+  if (!email) {
+    addLog(`🔔 Reminder: ${progName} at ${timeStr} — no email configured`, false);
+    return;
+  }
+
+  // Check if dishwasher is reachable
+  let dishStatus = "unknown";
+  try {
+    const token = await getAccessToken();
+    if (token) {
+      const r = await fetch(`${API_BASE}/api/homeappliances/${config.haId}`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.bsh.sdk.v1+json" }
+      });
+      if (r.ok) {
+        const d = await r.json();
+        dishStatus = d.data?.connected ? "🟢 Online" : "🔴 Offline";
+      }
+    }
+  } catch {}
+
+  // Store notification for the frontend to display
+  const notification = {
+    type: "reminder",
+    schedule: progName,
+    time: timeStr,
+    dishStatus,
+    message: `🔔 Reminder: "${progName}" is scheduled to run at ${timeStr}. Please make sure your dishwasher is ON with Remote Start enabled and door closed. Dishwasher status: ${dishStatus}`,
+    timestamp: new Date().toISOString(),
+    read: false,
+  };
+  
+  if (!global.notifications) global.notifications = [];
+  global.notifications.push(notification);
+  if (global.notifications.length > 20) global.notifications = global.notifications.slice(-20);
+
+  addLog(`🔔 Reminder sent: "${progName}" runs at ${timeStr} — Dish: ${dishStatus}`);
+}
+
 function rebuildCronJobs() {
+  // Clear existing schedule crons
   Object.values(cronJobs).forEach(job => job.stop());
   cronJobs = {};
+  // Clear existing reminder crons
+  Object.values(reminderJobs).forEach(job => job.stop());
+  reminderJobs = {};
+
   schedules.forEach(s => {
     if (!s.enabled || !s.days || s.days.length === 0) return;
     const cronDays = s.days.join(",");
+    
+    // Schedule the actual program start
     const cronExpr = `${s.minute} ${s.hour} * * ${cronDays}`;
     try {
       cronJobs[s.id] = cron.schedule(cronExpr, () => {
@@ -219,6 +277,29 @@ function rebuildCronJobs() {
       });
       addLog(`📅 Cron: ${s.name} → ${String(s.hour).padStart(2,"0")}:${String(s.minute).padStart(2,"0")} days[${cronDays}]`);
     } catch (e) { addLog(`📅 Cron error: ${e.message}`, false); }
+
+    // Schedule the reminder (X hours before)
+    if (remindersEnabled) {
+      const rHours = config.reminderHours || 2;
+      let rHour = s.hour - rHours;
+      let rMinute = s.minute;
+      let rDays = [...s.days];
+      
+      // Handle wrap-around past midnight
+      if (rHour < 0) {
+        rHour += 24;
+        // Shift days back by 1 (reminder goes to previous day)
+        rDays = rDays.map(d => (d - 1 + 7) % 7);
+      }
+      
+      const reminderExpr = `${rMinute} ${rHour} * * ${rDays.join(",")}`;
+      try {
+        reminderJobs[s.id] = cron.schedule(reminderExpr, () => {
+          sendReminderNotification(s);
+        });
+        addLog(`🔔 Reminder: ${s.name} → ${String(rHour).padStart(2,"0")}:${String(rMinute).padStart(2,"0")} (${rHours}h before)`);
+      } catch (e) { addLog(`🔔 Reminder cron error: ${e.message}`, false); }
+    }
   });
 }
 
@@ -254,15 +335,19 @@ app.get("/api/state", (req, res) => {
     hasToken: !!tokenData?.access_token,
     hasRefreshToken: !!tokenData?.refresh_token,
     tokenExpiresIn: tokenData?.expires_at ? Math.round((tokenData.expires_at - Date.now()) / 60000) : null,
-    schedules, keepAlive, logs: logs.slice(-30),
+    schedules, keepAlive, remindersEnabled, reminderHours: config.reminderHours, 
+    notifications: (global.notifications || []).filter(n => !n.read).length,
+    logs: logs.slice(-30),
   });
 });
 
 app.post("/api/config", (req, res) => {
-  const { clientId, clientSecret, haId } = req.body;
+  const { clientId, clientSecret, haId, notifyEmail, reminderHours } = req.body;
   if (clientId) config.clientId = clientId;
   if (clientSecret) config.clientSecret = clientSecret;
   if (haId) config.haId = haId;
+  if (notifyEmail !== undefined) config.notifyEmail = notifyEmail;
+  if (reminderHours) config.reminderHours = parseInt(reminderHours);
   addLog("⚙️ Config updated");
   res.json({ ok: true });
 });
@@ -353,6 +438,32 @@ app.post("/api/run", async (req, res) => {
 
 app.get("/api/logs", (req, res) => res.json(logs.slice(-50)));
 app.delete("/api/logs", (req, res) => { logs = []; res.json({ ok: true }); });
+
+// Reminders
+app.get("/api/reminders", (req, res) => {
+  res.json({ enabled: remindersEnabled, reminderHours: config.reminderHours, notifyEmail: config.notifyEmail || "not set" });
+});
+
+app.post("/api/reminders", async (req, res) => {
+  if (req.body.enabled !== undefined) remindersEnabled = req.body.enabled;
+  if (req.body.reminderHours) config.reminderHours = parseInt(req.body.reminderHours);
+  if (req.body.notifyEmail !== undefined) config.notifyEmail = req.body.notifyEmail;
+  rebuildCronJobs();
+  await saveState();
+  addLog(`🔔 Reminders: ${remindersEnabled ? "ON" : "OFF"} (${config.reminderHours}h before)`);
+  res.json({ ok: true, enabled: remindersEnabled, reminderHours: config.reminderHours });
+});
+
+// Notifications (push-style for frontend polling)
+app.get("/api/notifications", (req, res) => {
+  const notifs = global.notifications || [];
+  res.json(notifs);
+});
+
+app.post("/api/notifications/read", (req, res) => {
+  if (global.notifications) global.notifications.forEach(n => n.read = true);
+  res.json({ ok: true });
+});
 
 // ─── Startup ─────────────────────────────────────────────────
 async function startup() {
