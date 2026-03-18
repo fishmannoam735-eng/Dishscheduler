@@ -495,6 +495,17 @@ async function startup() {
     console.log(`   Appliance: ${config.haId || "not set"}`);
     console.log(`   Schedules: ${schedules.length}`);
     console.log(`   Keep-alive: ${keepAlive}`);
+
+    // ── Self-ping: prevent Render free tier from sleeping ──
+    const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    setInterval(async () => {
+      try {
+        await fetch(`${RENDER_URL}/`);
+        // Also save state to /tmp on every ping to keep it fresh
+        await saveState();
+      } catch {}
+    }, 10 * 60 * 1000); // every 10 minutes
+    addLog("🏠 Self-ping enabled — server will stay awake 24/7");
   });
 }
 
