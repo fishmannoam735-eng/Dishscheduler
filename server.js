@@ -406,6 +406,73 @@ app.post("/api/config", (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── Built-in OAuth Flow ─────────────────────────────────────
+// Step 1: User visits /auth → redirects to Home Connect
+app.get("/auth", (req, res) => {
+  const redirectUri = `${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}/auth/callback`;
+  const scopes = "IdentifyAppliance Monitor Control Settings Dishwasher Dishwasher-Control Dishwasher-Monitor Dishwasher-Settings";
+  const authUrl = `${API_BASE}/security/oauth/authorize?response_type=code&client_id=${config.clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}`;
+  res.redirect(authUrl);
+});
+
+// Step 2: Home Connect redirects back to /auth/callback with a code
+app.get("/auth/callback", async (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    return res.send(`<html><body style="background:#060a13;color:#fb7185;font-family:sans-serif;text-align:center;padding:60px">
+      <h2>❌ Authorization Failed</h2><p>No code received from Home Connect.</p>
+      <a href="/auth" style="color:#22d3ee">Try Again</a></body></html>`);
+  }
+
+  const redirectUri = `${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}/auth/callback`;
+  
+  try {
+    const r = await fetch(`${API_BASE}/security/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        redirect_uri: redirectUri,
+        code,
+      }),
+    });
+
+    if (!r.ok) {
+      const err = await r.text();
+      addLog(`🔑 OAuth callback failed: ${r.status}`, false);
+      return res.send(`<html><body style="background:#060a13;color:#fb7185;font-family:sans-serif;text-align:center;padding:60px">
+        <h2>❌ Token Exchange Failed</h2><p>HTTP ${r.status}</p><pre style="color:#7a8ba8;font-size:12px">${err}</pre>
+        <a href="/auth" style="color:#22d3ee">Try Again</a></body></html>`);
+    }
+
+    const data = await r.json();
+    data.expires_at = Date.now() + (data.expires_in || 86400) * 1000;
+    tokenData = data;
+    await saveState();
+
+    addLog("🔑 OAuth completed successfully via built-in flow!");
+    if (data.refresh_token) {
+      addLog(`🔑 Refresh token obtained ✓`);
+    }
+
+    res.send(`<html><body style="background:#060a13;color:#34d399;font-family:'Outfit',sans-serif;text-align:center;padding:60px">
+      <div style="font-size:60px;margin-bottom:20px">🎉</div>
+      <h2 style="font-size:24px;margin-bottom:10px">Connected Successfully!</h2>
+      <p style="color:#7a8ba8;margin-bottom:8px">Token: ✅ Active</p>
+      <p style="color:#7a8ba8;margin-bottom:8px">Refresh Token: ${data.refresh_token ? "✅ Stored" : "❌ Missing"}</p>
+      <p style="color:#7a8ba8;margin-bottom:30px">Expires in: ${Math.round((data.expires_at - Date.now()) / 60000)} minutes</p>
+      <p style="color:#4a5b75;font-size:13px">You can close this page and go back to the DishScheduler app.</p>
+    </body></html>`);
+  } catch (e) {
+    addLog(`🔑 OAuth callback error: ${e.message}`, false);
+    res.send(`<html><body style="background:#060a13;color:#fb7185;font-family:sans-serif;text-align:center;padding:60px">
+      <h2>❌ Error</h2><p>${e.message}</p>
+      <a href="/auth" style="color:#22d3ee">Try Again</a></body></html>`);
+  }
+});
+
 app.post("/api/token", async (req, res) => {
   tokenData = req.body;
   if (!tokenData.expires_at && tokenData.expires_in) {
