@@ -111,21 +111,75 @@ async function refreshAccessToken() {
 
 async function getAccessToken() {
   if (!tokenData) return null;
-  if (tokenData.expires_at && Date.now() > tokenData.expires_at - 120000) {
-    return await refreshAccessToken();
+  // If token is expired or will expire in next 30 minutes, refresh it
+  if (tokenData.expires_at && Date.now() > tokenData.expires_at - 1800000) {
+    const newToken = await refreshAccessToken();
+    if (newToken) return newToken;
+    // If refresh failed but token hasn't fully expired yet, try using it anyway
+    if (Date.now() < tokenData.expires_at) return tokenData.access_token;
+    return null;
   }
   return tokenData.access_token;
 }
 
-// Auto-refresh token every 20 hours
-cron.schedule("0 */20 * * *", () => {
+// Auto-refresh token every 6 hours (belt and suspenders)
+cron.schedule("0 */6 * * *", () => {
   if (tokenData?.refresh_token) {
-    addLog("🔑 Auto-refreshing token...");
+    addLog("🔑 Scheduled token refresh (every 6h)...");
     refreshAccessToken();
   }
 });
 
 // ─── Home Connect API Calls ──────────────────────────────────
+async function smartKeepAlive() {
+  const token = await getAccessToken();
+  if (!token || !config.haId) {
+    addLog("🏓 Keep-alive skipped: no token or appliance", false);
+    return false;
+  }
+  
+  // First check if the appliance is connected
+  try {
+    const r = await fetch(`${API_BASE}/api/homeappliances/${config.haId}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.bsh.sdk.v1+json" }
+    });
+    if (!r.ok) {
+      addLog(`🏓 Keep-alive: appliance check failed (HTTP ${r.status})`, false);
+      return false;
+    }
+    const d = await r.json();
+    if (!d.data?.connected) {
+      addLog("🏓 Keep-alive: dishwasher offline (deep sleep) — cannot reach it");
+      return false;
+    }
+  } catch (e) {
+    addLog(`🏓 Keep-alive: connection check error — ${e.message}`, false);
+    return false;
+  }
+
+  // Appliance is connected — send power on to keep it awake
+  try {
+    const r = await fetch(`${API_BASE}/api/homeappliances/${config.haId}/settings/BSH.Common.Setting.PowerState`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/vnd.bsh.sdk.v1+json" },
+      body: JSON.stringify({ data: { key: "BSH.Common.Setting.PowerState", value: "BSH.Common.EnumType.PowerState.On" } }),
+    });
+    if (r.status === 204 || r.ok) {
+      addLog("🏓 Keep-alive: PowerState.On sent ✓");
+      return true;
+    } else {
+      const e = await r.json().catch(() => ({}));
+      const msg = e?.error?.description || `HTTP ${r.status}`;
+      // Don't log as error if the appliance just doesn't support it in this state
+      addLog(`🏓 Keep-alive: ${msg}`);
+      return false;
+    }
+  } catch (e) {
+    addLog(`🏓 Keep-alive error: ${e.message}`, false);
+    return false;
+  }
+}
+
 async function sendPowerOn() {
   const token = await getAccessToken();
   if (!token || !config.haId) return false;
@@ -136,15 +190,15 @@ async function sendPowerOn() {
       body: JSON.stringify({ data: { key: "BSH.Common.Setting.PowerState", value: "BSH.Common.EnumType.PowerState.On" } }),
     });
     if (r.status === 204 || r.ok) {
-      addLog("🏓 Keep-alive: PowerState.On sent");
+      addLog("⚡ PowerState.On sent");
       return true;
     } else {
       const e = await r.json().catch(() => ({}));
-      addLog(`🏓 Keep-alive failed: ${e?.error?.description || r.status}`, false);
+      addLog(`⚡ Power on failed: ${e?.error?.description || r.status}`, false);
       return false;
     }
   } catch (e) {
-    addLog(`🏓 Keep-alive error: ${e.message}`, false);
+    addLog(`⚡ Power on error: ${e.message}`, false);
     return false;
   }
 }
@@ -307,9 +361,9 @@ function updateKeepAlive(enabled) {
   keepAlive = enabled;
   if (keepAliveCron) { keepAliveCron.stop(); keepAliveCron = null; }
   if (enabled) {
-    sendPowerOn();
-    keepAliveCron = cron.schedule("0 * * * *", () => sendPowerOn());
-    addLog("🏓 Keep-alive ON (every 60 min)");
+    smartKeepAlive(); // run immediately
+    keepAliveCron = cron.schedule("0 * * * *", () => smartKeepAlive());
+    addLog("🏓 Smart keep-alive ON (every 60 min, checks connectivity first)");
   } else {
     addLog("🏓 Keep-alive OFF");
   }
@@ -501,8 +555,15 @@ async function startup() {
     setInterval(async () => {
       try {
         await fetch(`${RENDER_URL}/`);
-        // Also save state to /tmp on every ping to keep it fresh
         await saveState();
+        // Also proactively check and refresh token if it expires within 2 hours
+        if (tokenData?.expires_at && tokenData?.refresh_token) {
+          const timeLeft = tokenData.expires_at - Date.now();
+          if (timeLeft < 2 * 60 * 60 * 1000) { // less than 2 hours left
+            addLog("🔑 Proactive token refresh (expires soon)...");
+            await refreshAccessToken();
+          }
+        }
       } catch {}
     }, 10 * 60 * 1000); // every 10 minutes
     addLog("🏠 Self-ping enabled — server will stay awake 24/7");
